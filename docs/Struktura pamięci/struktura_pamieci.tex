@@ -1,0 +1,88 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[polish]{babel}
+\usepackage{enumitem}
+\setlist[itemize]{label=-}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{RGB}{30, 64, 124}
+\definecolor{muted}{RGB}{95, 105, 120}
+
+\title{\textbf{\color{accent}Wstępna koncepcja podziału pamięci EEPROM 24LC32A}\\
+\large Projekt systemu przechowywania konfiguracji i logów zdarzeń na Raspberry Pi 5}
+\author{Wersja robocza -- Etap 1}
+\date{22.11.2026}
+
+\begin{document}
+
+\maketitle
+
+\section{Założenia sprzętowe układu 24LC32A}
+Układ \textbf{24LC32A} to szeregowa pamięć nieulotna EEPROM komunikująca się po magistrali \textbf{I2C}, o łącznej pojemności \textbf{32 Kbit}, czyli \textbf{4096 bajtów (4 KB)}. Projektując układ danych, należy uwzględnić następujące ograniczenia sprzętowe:
+
+\begin{itemize}
+    \item \textbf{Zakres adresowy:} 12-bitowy adres wewnętrzny od \texttt{0x0000} do \texttt{0x0FFF} (przesyłany jako 2 bajty po I2C).
+    \item \textbf{Stronicowanie (Page Write):} pamięć jest podzielona na strony po \textbf{32 bajty} (łącznie 128 stron). Zapis ciągły nie może przekroczyć granicy strony (nastąpiłoby zawinięcie i nadpisanie początku tej samej strony).
+    \item \textbf{Czas cyklu zapisu:} do \textbf{5 ms} po wysłaniu warunku STOP; przed kolejną operacją wymagane jest odczekanie lub odpytywanie gotowości układu (\textit{ACK polling}).
+    \item \textbf{Ochrona przed zapisem (WP):} pin sprzętowy sterowany z GPIO Raspberry Pi 5 (poprzez \texttt{libgpiod}) -- stan wysoki blokuje zapis, stan niski umożliwia modyfikację pamięci.
+\end{itemize}
+
+\section{Proponowany podział przestrzeni 4096 bajtów}
+Cała przestrzeń adresowa zostaje podzielona na trzy logiczne obszary dopasowane do rozmiaru stron 32-bajtowych, co ułatwia ich niezależną aktualizację oraz weryfikację integralności.
+
+\vspace{0.3cm}
+\noindent
+\begin{tabularx}{\textwidth}{@{} l l l X @{}}
+\toprule
+\textbf{Obszar} & \textbf{Zakres adresów} & \textbf{Rozmiar} & \textbf{Przeznaczenie i zabezpieczenie} \\
+\midrule
+\textbf{Superblock} & \texttt{0x0000 -- 0x001F} & 32 B (1 strona) & Metadane struktury: \textit{magic bytes}, wersja formatu, flagi stanu, granice sekcji oraz suma kontrolna \textbf{CRC16}. \\
+\addlinespace
+\textbf{Konfiguracja} & \texttt{0x0020 -- 0x00FF} & 224 B (7 stron) & Parametry pracy aplikacji, progi/ustawienia oraz suma kontrolna \textbf{CRC16} dla całego bloku konfiguracyjnego. \\
+\addlinespace
+\textbf{Bufor kołowy logów} & \texttt{0x0100 -- 0x0FFF} & 3840 B (120 stron) & Cykliczny zapis wpisów zdarzeń (rekordy o stałej długości) z sumą kontrolną \textbf{CRC8} w każdym rekordzie. \\
+\bottomrule
+\end{tabularx}
+\vspace{0.3cm}
+
+\noindent
+\textit{Uwaga:} Podział na strefy jest wstępny i może zostać skorygowany na etapie implementacji po ustaleniu ostatecznego rozmiaru pojedynczego rekordu logu oraz liczby parametrów konfiguracyjnych.
+
+\section{Opis poszczególnych sekcji}
+
+\subsection{Superblock (\texttt{0x0000 -- 0x001F})}
+Nagłówek umieszczony na początku pamięci służy do identyfikacji formatu oraz sprawdzenia, czy układ został już poprawnie zainicjalizowany:
+\begin{itemize}
+    \item \textbf{Magic signature:} stały ciąg bajtów pozwalający odróżnić zainicjalizowaną strukturę od surowej pamięci (wypełnionej wartościami \texttt{0xFF}) lub obcych danych.
+    \item \textbf{Wersja formatu:} numer wersji układu danych na wypadek zmian struktury w kolejnych etapach.
+    \item \textbf{Flagi stanu:} podstawowa informacja o stanie systemu (np. poprawne zamknięcie, flaga inicjalizacji).
+    \item \textbf{Offsety i rozmiary obszarów:} opis położenia strefy konfiguracji oraz bufora kołowego.
+    \item \textbf{CRC16:} suma kontrolna liczona po polach nagłówka w celu wykrycia uszkodzeń metadanych.
+\end{itemize}
+
+\subsection{Strefa konfiguracji (\texttt{0x0020 -- 0x00FF})}
+Wydzielony obszar o wielokrotności rozmiaru strony (7 stron po 32 B) przeznaczony na rzadko zmieniane ustawienia urządzenia. Zabezpieczenie bloku sumą \textbf{CRC16} pozwala wykryć przerwanie zapisu (np. zanik zasilania w trakcie aktualizacji ustawień).
+
+\subsection{Bufor kołowy logów (\texttt{0x0100 -- 0x0FFF})}
+Przestrzeń 3840 bajtów działająca jako bufor cykliczny (\textit{ring buffer}) dla zdarzeń systemowych:
+\begin{itemize}
+    \item \textbf{Stały rozmiar rekordu:} np. 16 B lub 32 B (dzielnik rozmiaru strony 32 B), dzięki czemu pojedynczy wpis mieści się w jednej stronie EEPROM i nie wymaga dzielenia zapisu między dwie strony.
+    \item \textbf{Zawijanie (wrap-around):} po zapełnieniu obszaru do adresu \texttt{0x0FFF} kolejne wpisy nadpisują najstarsze rekordy od początku strefy (\texttt{0x0100}).
+    \item \textbf{Lekka weryfikacja CRC8:} każdy rekord przechowuje własną sumę \textbf{CRC8}, co minimalizuje narzut pamięciowy (1 bajt na rekord) i pozwala pominąć uszkodzony wpis przy odczycie historii.
+\end{itemize}
+
+\section{Architektura oprogramowania (warstwa HAL)}
+W projekcie przyjęto podział warstwowy oddzielający logikę formatu danych od niskopoziomowego dostępu do sprzętu Raspberry Pi 5:
+\begin{itemize}
+    \item \textbf{Warstwa HAL (Hardware Abstraction Layer):} interfejsy niskopoziomowe obsługujące magistralę I2C (\texttt{/dev/i2c-1}), dzielenie zapisów na strony 32-bajtowe, oczekiwanie na zakończenie cyklu zapisu oraz sterowanie pinem \texttt{WP} przez \texttt{libgpiod}.
+    \item \textbf{Warstwa logiczna pamięci:} obsługa superblocka, serializacja konfiguracji, logika bufora kołowego oraz wyliczanie i weryfikacja sum kontrolnych CRC8/CRC16.
+    \item \textbf{Warstwa aplikacji:} udostępnienie prostych operacji zapisu zdarzeń, odczytu historii oraz aktualizacji konfiguracji bez znajomości szczegółów sprzętowych układu 24LC32A.
+\end{itemize}
+
+\end{document}

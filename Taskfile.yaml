@@ -1,0 +1,55 @@
+version: "3"
+
+vars:
+  RPI_HOST: '{{.RPI_HOST | default "wiktor@skynet.local"}}'
+  RPI_DIR: '{{.RPI_DIR | default "~/eeprom-24lc32a-storage"}}'
+  BUILD_DIR: '{{.BUILD_DIR | default "build"}}'
+  LOCAL_LOG: '{{.LOCAL_LOG | default "build-rpi.log"}}'
+  CMAKE_BUILD_TYPE: '{{.CMAKE_BUILD_TYPE | default "Release"}}'
+  APP_BIN: '{{.APP_BIN | default "eeprom_app"}}'
+  APP_ARGS: '{{.APP_ARGS | default ""}}'
+  DOCS_DIR: '{{.DOCS_DIR | default "docs"}}'
+
+tasks:
+  sync:
+    desc: Send project to raspberrypi
+    cmds:
+      - >
+        C:/Windows/System32/tar.exe
+        --exclude=.git
+        --exclude=build
+        --exclude=docs
+        --exclude=*.log
+        -cf - . | ssh {{.RPI_HOST}} "mkdir -p {{.RPI_DIR}} && tar -xmf - -C {{.RPI_DIR}}"
+
+  build:
+    desc: Configure and compile project on RPi5
+    deps: [sync]
+    cmds:
+      - >
+        ssh {{.RPI_HOST}}
+        "set -o pipefail && mkdir -p {{.RPI_DIR}}/{{.BUILD_DIR}} && cd {{.RPI_DIR}}/{{.BUILD_DIR}} && cmake -DCMAKE_BUILD_TYPE={{.CMAKE_BUILD_TYPE}} .. && cmake --build . -j\$(nproc)"
+
+  run:
+    desc: Build project and run on RPi5
+    deps: [build]
+    cmds:
+      - ssh -t {{.RPI_HOST}} "cd {{.RPI_DIR}}/{{.BUILD_DIR}} && ./{{.APP_BIN}} {{.APP_ARGS}}"
+
+  all:
+    desc: Sync, build and run on RPi5 sequentially
+    cmds:
+      - task: sync
+      - task: build
+      - task: run
+
+  clean:
+    desc: Clean build on RPi5 and local log file
+    cmds:
+      - ssh {{.RPI_HOST}} "rm -rf {{.RPI_DIR}}/{{.BUILD_DIR}}"
+      - powershell -NoProfile -Command "Remove-Item -Force -ErrorAction SilentlyContinue '{{.LOCAL_LOG}}'"
+
+  docs:
+    desc: Compile all tex files in docs and clean temp files
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-docs.ps1 -DocsDir "{{.DOCS_DIR}}"
